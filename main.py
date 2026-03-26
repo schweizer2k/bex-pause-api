@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Literal
 import re
 
-app = FastAPI(title="Bex Pause Speech API", version="1.0.0")
+app = FastAPI(title="Bex Pause Speech API", version="1.1.0")
 
 
 class ConvertRequest(BaseModel):
@@ -28,8 +28,9 @@ class ConvertResponse(BaseModel):
 
 def convert_pause_markup(text: str):
     pauses = []
+    working_text = text
 
-    def replace_pause(match):
+    def replace_explicit_pause(match):
         full = match.group(0)
         value = match.group(1)
         unit = match.group(2)
@@ -48,13 +49,30 @@ def convert_pause_markup(text: str):
 
         return f"<break time=\"{duration_ms}ms\"/>"
 
-    pattern = r"\[pause:(\d+)(ms|s)\]"
-    ssml_body = re.sub(pattern, replace_pause, text)
+    def replace_empty_pause(match):
+        full = match.group(0)
+        pos = match.start()
 
-    normalized_text = re.sub(pattern, "", text)
+        pauses.append({
+            "source": full,
+            "position": pos,
+            "durationMs": 1000,
+            "type": "explicit"
+        })
+
+        return "<break time=\"1000ms\"/>"
+
+    explicit_pattern = r"\[pause:(\d+)(ms|s)\]"
+    empty_pause_pattern = r"\[\]"
+
+    working_text = re.sub(explicit_pattern, replace_explicit_pause, working_text)
+    working_text = re.sub(empty_pause_pattern, replace_empty_pause, working_text)
+
+    normalized_text = re.sub(explicit_pattern, "", text)
+    normalized_text = re.sub(empty_pause_pattern, "", normalized_text)
     normalized_text = re.sub(r"\s+", " ", normalized_text).strip()
 
-    return normalized_text, ssml_body, pauses
+    return normalized_text, working_text, pauses
 
 
 @app.get("/")
@@ -65,7 +83,6 @@ def root():
 @app.post("/speech/convert", response_model=ConvertResponse)
 def convert_speech(req: ConvertRequest):
     normalized_text, ssml_body, pauses = convert_pause_markup(req.text)
-
     ssml = f"<speak>{ssml_body}</speak>"
 
     if req.outputMode == "ssml":
