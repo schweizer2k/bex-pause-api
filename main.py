@@ -1,15 +1,19 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, Literal, Tuple
 import re
 import os
 import uuid
-import tempfile
 import html
+from pathlib import Path
 import azure.cognitiveservices.speech as speechsdk
 
-app = FastAPI(title="Bex Pause Speech API", version="1.4.0")
+app = FastAPI(title="Bex Pause Speech API", version="1.5.0")
+
+BASE_DIR = Path(__file__).resolve().parent
+AUDIO_DIR = BASE_DIR / "generated_audio"
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class ConvertRequest(BaseModel):
@@ -18,11 +22,11 @@ class ConvertRequest(BaseModel):
     outputMode: Literal["ssml", "text", "both"] = "both"
     contentType: Literal["default", "movement_story"] = "default"
     autoDetectSignals: bool = True
-    signalPauseMs: int = 5000
-    examplePauseMs: int = 4000
-    ellipsisPauseMs: int = 500
-    paragraphPauseMs: int = 1200
-    linebreakPauseMs: int = 350
+    signalPauseMs: int = 6000
+    examplePauseMs: int = 5000
+    ellipsisPauseMs: int = 700
+    paragraphPauseMs: int = 1500
+    linebreakPauseMs: int = 500
 
 
 class DetectedPause(BaseModel):
@@ -46,6 +50,28 @@ class SynthesizeRequest(BaseModel):
     text: Optional[str] = None
     voice: str = "de-DE-KatjaNeural"
     format: Literal["mp3"] = "mp3"
+
+
+class StoryAudioRequest(BaseModel):
+    text: str
+    language: str = "de-DE"
+    contentType: Literal["movement_story"] = "movement_story"
+    autoDetectSignals: bool = True
+    signalPauseMs: int = 6000
+    examplePauseMs: int = 5000
+    ellipsisPauseMs: int = 700
+    paragraphPauseMs: int = 1500
+    linebreakPauseMs: int = 500
+    voice: str = "de-DE-KatjaNeural"
+    title: Optional[str] = None
+
+
+class StoryAudioResponse(BaseModel):
+    audioUrl: str
+    title: str
+    durationMs: Optional[int] = None
+    detectedSignalWords: List[str] = []
+    detectedExampleWords: List[str] = []
 
 
 def extract_story_markers(text: str) -> Tuple[List[str], List[str]]:
@@ -186,20 +212,20 @@ def convert_pause_markup(
     return normalized_text, ssml_text, pauses, detected_signal_words, detected_example_words
 
 
-def build_voice_wrapped_ssml(ssml_or_text: str, voice: str, is_ssml: bool) -> str:
+def build_voice_wrapped_ssml(ssml_or_text: str, voice: str, is_ssml: bool, language: str = "de-DE") -> str:
     if is_ssml:
         ssml = ssml_or_text.strip()
         if "<voice" in ssml:
             return ssml
         if ssml.startswith("<speak"):
             return ssml.replace(">", f'><voice name="{voice}">', 1).replace("</speak>", "</voice></speak>")
-        return f'<speak version="1.0" xml:lang="de-DE"><voice name="{voice}">{ssml}</voice></speak>'
+        return f'<speak version="1.0" xml:lang="{language}"><voice name="{voice}">{ssml}</voice></speak>'
 
     safe_text = html.escape(ssml_or_text)
-    return f'<speak version="1.0" xml:lang="de-DE"><voice name="{voice}">{safe_text}</voice></speak>'
+    return f'<speak version="1.0" xml:lang="{language}"><voice name="{voice}">{safe_text}</voice></speak>'
 
 
-def synthesize_ssml_to_mp3(ssml: str, voice: str) -> str:
+def synthesize_ssml_to_mp3(ssml: str, voice: str, output_path: Path) -> None:
     key = os.getenv("AZURE_SPEECH_KEY")
     region = os.getenv("AZURE_SPEECH_REGION")
     endpoint = os.getenv("AZURE_SPEECH_ENDPOINT")
@@ -213,13 +239,13 @@ def synthesize_ssml_to_mp3(ssml: str, voice: str) -> str:
         speech_config = speechsdk.SpeechConfig(subscription=key, region=region)
     else:
         raise HTTPException(status_code=500, detail="Azure Speech Region oder Endpoint fehlt.")
+
     speech_config.speech_synthesis_voice_name = voice
     speech_config.set_speech_synthesis_output_format(
         speechsdk.SpeechSynthesisOutputFormat.Audio16Khz128KBitRateMonoMp3
     )
 
-    filename = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp3")
-    audio_config = speechsdk.audio.AudioOutputConfig(filename=filename)
+    audio_config = speechsdk.audio.AudioOutputConfig(filename=str(output_path))
 
     synthesizer = speechsdk.SpeechSynthesizer(
         speech_config=speech_config,
@@ -237,12 +263,23 @@ def synthesize_ssml_to_mp3(ssml: str, voice: str) -> str:
                 message = f"{message} {details.error_details}"
         raise HTTPException(status_code=500, detail=message)
 
-    return filename
-
 
 @app.get("/")
 def root():
     return {"message": "Bex Pause Speech API läuft."}
+
+
+@app.get("/audio/{filename}")
+def get_audio(filename: str):
+    safe_name = os.path.basename(filename)
+    file_path = AUDIO_DIR / safe_name
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Audio-Datei nicht gefunden.")
+    return FileResponse(
+        file_path,
+        media_type="audio/mpeg",
+        filename=safe_name
+    )
 
 
 @app.post("/speech/convert", response_model=ConvertResponse)
@@ -295,10 +332,44 @@ def synthesize_speech(req: SynthesizeRequest):
 
     payload = req.ssml if req.ssml else req.text
     ssml = build_voice_wrapped_ssml(payload, req.voice, is_ssml=bool(req.ssml))
-    filename = synthesize_ssml_to_mp3(ssml, req.voice)
+    filename = f"{uuid.uuid4()}.mp3"
+    output_path = AUDIO_DIR / filename
+    synthesize_ssml_to_mp3(ssml, req.voice, output_path)
 
     return FileResponse(
-        filename,
+        output_path,
         media_type="audio/mpeg",
         filename="bex-audio.mp3"
+    )
+
+
+@app.post("/speech/story-audio", response_model=StoryAudioResponse)
+def story_audio(req: StoryAudioRequest, request: Request):
+    normalized_text, ssml_body, pauses, signal_words, example_words = convert_pause_markup(
+        req.text,
+        req.contentType,
+        req.autoDetectSignals,
+        req.signalPauseMs,
+        req.examplePauseMs,
+        req.ellipsisPauseMs,
+        req.paragraphPauseMs,
+        req.linebreakPauseMs
+    )
+
+    ssml = f'<speak version="1.0" xml:lang="{req.language}"><voice name="{req.voice}">{ssml_body}</voice></speak>'
+
+    filename = f"{uuid.uuid4()}.mp3"
+    output_path = AUDIO_DIR / filename
+    synthesize_ssml_to_mp3(ssml, req.voice, output_path)
+
+    audio_url = str(request.base_url).rstrip("/") + f"/audio/{filename}"
+
+    inferred_title = req.title or "Bewegungsgeschichte"
+
+    return StoryAudioResponse(
+        audioUrl=audio_url,
+        title=inferred_title,
+        durationMs=None,
+        detectedSignalWords=signal_words,
+        detectedExampleWords=example_words
     )
